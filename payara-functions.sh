@@ -27,7 +27,6 @@ payara_download() {
   fi
 }
 
-# TODO: how to get cpu count on linux?
 payara_run() {
   print_info "PAYARA::RUN - Starting payara $PAYARA_VERSION."
   local http_port=$1
