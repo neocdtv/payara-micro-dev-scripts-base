@@ -5,12 +5,10 @@ TMP_DIR="/tmp"
 PAYARA_VERSION="5.2020.4";
 PAYARA_DIR="$TMP_DIR/payara-micro"
 PAYARA_VERSION_DIR="$PAYARA_DIR/$PAYARA_VERSION"
-PAYARA_CHECKPOINT_DIR="$PAYARA_VERSION_DIR/checkpoint-image"
-PAYARA_ROOT_DIR="$PAYARA_VERSION_DIR/payara-root"
 PAYARA_JAR="$PAYARA_VERSION_DIR/payara-micro-$PAYARA_VERSION.jar"
-PAYARA_WARM_UP_CLASSES_LST="$PAYARA_VERSION_DIR/payara-classes.lst"
-PAYARA_WARM_UP_CLASSES_JSA="$PAYARA_VERSION_DIR/payara-classes.jsa"
-PAYARA_WARM_UP_LAUNCHER="$PAYARA_ROOT_DIR/launch-micro.jar"
+PAYARA_WARMED_UP_CLASSES_LST="payara-classes.lst"
+PAYARA_WARMED_UP_CLASSES_JSA="payara-classes.jsa"
+PAYARA_WARMED_UP_LAUNCHER="launch-micro.jar"
 
 APP_HTTP_PORT=8080
 APP_DEBUG_PORT=5005
@@ -29,11 +27,23 @@ payara_download() {
 
 payara_run() {
   print_info "PAYARA::RUN - Starting payara $PAYARA_VERSION."
-  local http_port=$1
-  local debug_port=$2
+  local app_name=$1
+  local http_port=$2
+  local debug_port=$3
+  local app_path=$4
+  local paraya_options=$5
+  if [ ! "$#" -eq 5 ]; then
+    echo "payara_run needs 5 parameter: app_name http_port debug_port app_path payara_options"
+    echo "example: payara_run app 8080 5005 \"$HOME/Projects/app/target/app\" \"--prebootcommandfile $HOME/Projects/app/target/app/pre-boot-commands.txt\""
+    return 1
+  fi
+
+  local payara_root="$PAYARA_VERSION_DIR/$app_name/payara-root"
+  mkdir -p "$payara_root"
   payara_download
-  payara_warm_up
-  echo "RUNNING" > "$PAYARA_ROOT_DIR/docroot/status.txt"
+  payara_warm_up $payara_root
+  # ensure that a minimal web-app is present with a empty WEB-INF
+  mkdir -p "$app_path/WEB-INF"
   java\
     -XX:-UsePerfData\
 	  -XX:+TieredCompilation\
@@ -42,58 +52,55 @@ payara_run() {
 	  -XX:ActiveProcessorCount=$(get_cpu_cores)\
 	  -XX:CICompilerCount=$(get_cpu_cores)\
 	  -Xshare:on\
-	  -XX:SharedArchiveFile="$PAYARA_WARM_UP_CLASSES_JSA"\
+	  -XX:SharedArchiveFile="$payara_root/$PAYARA_WARMED_UP_CLASSES_JSA"\
 	  -Xlog:class+path=info\
 	  -Xverify:none\
 	  -Xdebug\
 	  -Xrunjdwp:transport=dt_socket,server=y,suspend=n,address="$debug_port"\
 	  -Dorg.glassfish.deployment.trace\
-	  -jar "$PAYARA_WARM_UP_LAUNCHER"\
+	  -jar "$payara_root/$PAYARA_WARMED_UP_LAUNCHER"\
+	  --deploy "$app_path"\
 	  --nocluster\
 	  --contextroot "/"\
-	  --port "$http_port" &
-}
-
-app_deploy() {
-  print_info "APP::DEPLOY"
-  local app_path="$1"
-  local app_name="$2"
-  ln -s "$app_path" "$PAYARA_ROOT_DIR/autodeploy/$2"
+	  --port "$http_port" $paraya_options
 }
 
 app_redeploy() {
   print_info "APP::REDEPLOY"
+  local app_path=$1
+  echo "" > "$app_path/.reload"
   # check if deployed
   # update .reload
-  echo "bla"
 }
 
 payara_clean() {
-  print_info "PAYARA::CLEAN"
-  sudo rm -fvr "$PAYARA_ROOT_DIR"
-  sudo rm -fvr "$PAYARA_WARM_UP_CLASSES_LST"
-  sudo rm -fvr "$PAYARA_WARM_UP_CLASSES_JSA"
-}
-
-checkpoint_clean() {
-  print_info "CHECKPOINT::CLEAN"
-  sudo rm -fvr "$PAYARA_CHECKPOINT_DIR"
+  local app_name=$1
+  print_info "PAYARA::CLEAN - Cleaning up warmed up payara and checkpoint for app $app_name."
+  sudo rm -fvr "$PAYARA_VERSION_DIR/$app_name"
 }
 
 checkpoint_create() {
-  print_info "CHECKPOINT::CREATE"
+  local prefix="CHECKPOINT::CREATE"
   local app_name=$1
   local http_port=$2
-  local checkpoint_dir="$PAYARA_CHECKPOINT_DIR/$app_name"
-  sudo rm -r "$checkpoint_dir"
+  local checkpoint_dir="$PAYARA_VERSION_DIR/$app_name/checkpoint"
+  print_info "$prefix - Creating checkpoint at $checkpoint_dir for app $app_name running on port $http_port (CRIU)."
+  if [ -d "$checkpoint_dir" ]; then
+    sudo rm -r "$checkpoint_dir"
+  fi
   mkdir -p "$checkpoint_dir"
   local payara_pid="$(payara_find $http_port)"
-  sudo criu dump -vvvv --shell-job -t $payara_pid --log-file criu-dump.log --tcp-established --images-dir "$checkpoint_dir"
+  sudo criu-ns dump -vvvv --shell-job -t $payara_pid --log-file criu-dump.log --tcp-close --images-dir "$checkpoint_dir"
+  sudo chmod -R a+rw "$checkpoint_dir"
 }
 
 checkpoint_restore() {
-  print_info "CHECKPOINT::RESTORE"
-  sudo criu-ns restore -vvvv --shell-job --log-file criu-restore.log --tcp-established --images-dir "$PAYARA_CHECKPOINT_DIR"
+  ccr_setup_vars
+  local prefix="CHECKPOINT::RESTORE"
+  local app_name=$1
+  local checkpoint_dir="$PAYARA_VERSION_DIR/$app_name/checkpoint"
+  print_info "$prefix - Restoring checkpoint at $checkpoint_dir for app $app_name (CRIU)."
+  sudo criu-ns restore -vvvv --shell-job --log-file criu-restore.log --tcp-close --images-dir "$checkpoint_dir"
 }
 
 payara_kill() {
@@ -121,97 +128,121 @@ get_cpu_cores() {
 
 payara_warm_up() {
   local prefix="PAYARA::WARM UP"
-  is_payara_warmed_up
+  local payara_root=$1
+  is_payara_warmed_up $payara_root
   local payara_warmed_up=$?
   if [ ! $payara_warmed_up -eq 0 ]; then
-    print_info "$prefix -  Payara $PAYARA_VERSION not warmed up (AppCDS). Warming up...";
+    print_info "$prefix -  Payara at $payara_root is not warmed up (AppCDS). Warming up...";
     java\
       -jar "$PAYARA_JAR" \
 	    --nocluster\
-	    --rootDir "$PAYARA_ROOT_DIR"\
+	    --rootDir "$payara_root"\
 	    --outputlauncher
     java\
-      -XX:DumpLoadedClassList="$PAYARA_WARM_UP_CLASSES_LST"\
-	    -jar "$PAYARA_WARM_UP_LAUNCHER"\
+      -XX:DumpLoadedClassList="$payara_root/$PAYARA_WARMED_UP_CLASSES_LST"\
+	    -jar "$payara_root/$PAYARA_WARMED_UP_LAUNCHER"\
 	    --nocluster\
 	    --warmup
     java\
       -Xshare:dump\
-	    -XX:SharedClassListFile="$PAYARA_WARM_UP_CLASSES_LST"\
-	    -XX:SharedArchiveFile="$PAYARA_WARM_UP_CLASSES_JSA"\
-	    -jar "$PAYARA_WARM_UP_LAUNCHER"\
+	    -XX:SharedClassListFile="$payara_root/$PAYARA_WARMED_UP_CLASSES_LST"\
+	    -XX:SharedArchiveFile="$payara_root/$PAYARA_WARMED_UP_CLASSES_JSA"\
+	    -jar "$payara_root/$PAYARA_WARMED_UP_LAUNCHER"\
 	    --nocluster
   else
-    print_info "$prefix - Payara $PAYARA_VERSION is warmed up (AppCDS).";
+    print_info "$prefix - Payara at $payara_root is warmed up (AppCDS).";
   fi
 }
 
 is_payara_warmed_up() {
-  if [ -f "$PAYARA_WARM_UP_LAUNCHER" ] && [ -f "$PAYARA_WARM_UP_CLASSES_LST" ] && [ -f "$PAYARA_WARM_UP_CLASSES_JSA" ]; then
+  local payara_root=$1
+  if [ -f "$payara_root/$PAYARA_WARMED_UP_LAUNCHER" ] && [ -f "$payara_root/$PAYARA_WARMED_UP_CLASSES_JSA" ]; then
     return 0
   else
     return 1
   fi
 }
 
-app_run() {
-  local app_name=$1
-  local http_port=$2
-  local checkpoint_dir="$PAYARA_CHECKPOINT_DIR/$app_name"
-  is_criu_available
-  local criu_available=$?
-  if [ $criu_available -eq 0 ] && [ -d "$checkpoint_dir" ] && [ -d "$PAYARA_ROOT_DIR" ]; then
-    app_restore
-  else
-    payara_run
-    is_app_ready
-    local app_ready=$?
-    if [ $criu_available -eq 0 ] && [ $app_ready -eq 0 ]; then
-      app_dump
-      app_restore
-    fi
-  fi
-}
-
 is_app_ready() {
-  local url="http://localhost:8080/status.html"
+  local status_url=$1
   local expected_status=200
   local max_wait_count=80
-  check_response_code $url $expected_status $max_wait_count
-  return $?;
-}
-
-is_payara_ready() {
-  local url="http://localhost:$APP_HTTP_PORT/status.txt"
-  local expected_status=200
-  local max_wait_count=80
-  check_response_code $url $expected_status $max_wait_count
+  check_response_code $status_url $expected_status $max_wait_count
   return $?;
 }
 
 check_response_code() {
   local prefix="CHECK::APP"
-  local url=$1
+  local status_url=$1
   local expected_status=$2
   local max_wait_count=$3
   local next_wait_count=1
   local sleep_time=0.25 # 250ms
-  until [ $next_wait_count -gt $max_wait_count ] || [ $(curl -s -o /dev/null -w "%{http_code}" $url) == $expected_status ]; do
-    print_info "$prefix - Waiting for application to handle http traffic. Checking with url $url. Check $next_wait_count of $max_wait_count."
+  until [ $next_wait_count -gt $max_wait_count ] || [ $(curl -s -o /dev/null -w "%{http_code}" $status_url) == $expected_status ]; do
+    print_info "$prefix - Waiting for application to handle http traffic. Checking with status_url $status_url. Check $next_wait_count of $max_wait_count."
     sleep $sleep_time
     (( next_wait_count++ ))
   done
   if [ $next_wait_count -gt $max_wait_count ]
   then
-    print_error "$prefix - Application is not ready to handle http traffic. Waited $max_wait_count x $sleep_time sec. Checked url was $url."
+    print_error "$prefix - Application is not ready to handle http traffic. Waited $max_wait_count x $sleep_time sec. Checked status_url was $status_url."
     return 1;
   else
     local waited=$((next_wait_count-1))
-    print_info "$prefix - Application is ready to handle http traffic. Waited $waited x $sleep_time sec. Checked url was $url."
+    print_info "$prefix - Application is ready to handle http traffic. Waited $waited x $sleep_time sec. Checked status_url was $status_url."
     return 0;
   fi
 }
 
+backend_run() {
+  ccr_setup_vars
+  local app_name="backend"
+  local http_port=8080
+  local debug_port=9009
+  local status_url="http://localhost:$http_port/ccr/appmonitoring/ping"
+  local app_path="$CCR/ccr/backend/target/backend"
+  local payara_options="--prebootcommandfile $CCR/ccr/backend/src/main/resources/pre-boot-commands.txt"
+  app_run $app_name $http_port $debug_port $status_url "$app_path" "$payara_options"
+}
+
+app_run() {
+  local app_name=$1
+  local http_port=$2
+  local debug_port=$3
+  local status_url=$4
+  local app_path="$5"
+  local payara_options="$6"
+  local checkpoint_dir="$PAYARA_VERSION_DIR/$app_name/checkpoint"
+  local payara_root="$PAYARA_VERSION_DIR/$app_name/payara-root"
+  payara_kill $http_port
+  is_criu_available
+  local criu_available=$?
+  if [ $criu_available -eq 0 ] && [ -d "$checkpoint_dir" ] && [ -d "$payara_root" ]; then
+    checkpoint_restore $app_name &
+    is_app_ready $status_url
+  else
+    payara_run $app_name $http_port $debug_port "$app_path" "$payara_options" &
+    is_app_ready $status_url
+    local app_ready=$?
+    if [ $criu_available -eq 0 ] && [ $app_ready -eq 0 ]; then
+      checkpoint_create $app_name $http_port
+      checkpoint_restore $app_name &
+      is_app_ready $status_url
+    fi
+  fi
+}
+
+backend_payara_clean() {
+  payara_clean backend
+}
+
+backend_redeploy() {
+  app_redeploy $CCR/ccr/backend/target/backend
+}
+
+is_backend_ready() {
+  is_app_ready http://localhost:8080/ccr/appmonitoring/ping
+}
 
 # print
 COLOR_GREEN='\033[1;34m'
