@@ -38,12 +38,12 @@ payara_run() {
     return 1
   fi
 
-  local payara_root="$PAYARA_VERSION_DIR/$app_name/payara-root"
+  local payara_root="$(get_payara_root_dir $app_name)"
   mkdir -p "$payara_root"
   payara_download
   payara_warm_up $payara_root
   # ensure that a minimal web-app is present with a empty WEB-INF
-  mkdir -p "$app_path/WEB-INF"
+  sudo mkdir -p "$app_path/WEB-INF"
   java\
     -XX:-UsePerfData\
 	  -XX:+TieredCompilation\
@@ -83,24 +83,29 @@ checkpoint_create() {
   local prefix="CHECKPOINT::CREATE"
   local app_name=$1
   local http_port=$2
-  local checkpoint_dir="$PAYARA_VERSION_DIR/$app_name/checkpoint"
+  local checkpoint_dir="$(get_checkpoint_dir $app_name)"
   print_info "$prefix - Creating checkpoint at $checkpoint_dir for app $app_name running on port $http_port (CRIU)."
   if [ -d "$checkpoint_dir" ]; then
-    sudo rm -r "$checkpoint_dir"
+    sudo rm -rvf "$checkpoint_dir"
   fi
   mkdir -p "$checkpoint_dir"
   local payara_pid="$(payara_find $http_port)"
-  sudo criu-ns dump -vvvv --shell-job -t $payara_pid --log-file criu-dump.log --tcp-close --images-dir "$checkpoint_dir"
+  if [ "$payara_pid" == "" ]; then
+    print_error "$prefix - Can't find payara on port $http_port."
+    return 1
+  fi
+  sudo criu dump -vvvv --shell-job -t $payara_pid --log-file criu-dump.log --tcp-established --ext-unix-sk --images-dir "$checkpoint_dir"
   sudo chmod -R a+rw "$checkpoint_dir"
 }
 
 checkpoint_restore() {
-  ccr_setup_vars
   local prefix="CHECKPOINT::RESTORE"
   local app_name=$1
-  local checkpoint_dir="$PAYARA_VERSION_DIR/$app_name/checkpoint"
+  local checkpoint_dir="$(get_checkpoint_dir $app_name)"
   print_info "$prefix - Restoring checkpoint at $checkpoint_dir for app $app_name (CRIU)."
-  sudo criu-ns restore -vvvv --shell-job --log-file criu-restore.log --tcp-close --images-dir "$checkpoint_dir"
+  sudo criu-ns restore -vvvv --shell-job --log-file criu-restore.log --tcp-established --ext-unix-sk --images-dir "$checkpoint_dir"
+  sudo chmod -R a+rw "$checkpoint_dir"
+  tail -f "$checkpoint_dir/criu-restore.log"
 }
 
 payara_kill() {
@@ -166,7 +171,7 @@ is_payara_warmed_up() {
 is_app_ready() {
   local status_url=$1
   local expected_status=200
-  local max_wait_count=80
+  local max_wait_count=120
   check_response_code $status_url $expected_status $max_wait_count
   return $?;
 }
@@ -195,7 +200,6 @@ check_response_code() {
 }
 
 backend_run() {
-  ccr_setup_vars
   local app_name="backend"
   local http_port=8080
   local debug_port=9009
@@ -205,6 +209,16 @@ backend_run() {
   app_run $app_name $http_port $debug_port $status_url "$app_path" "$payara_options"
 }
 
+backend_run_simple() {
+  local app_name="backend"
+  local http_port=8080
+  local debug_port=9009
+  local status_url="http://localhost:$http_port/ccr/appmonitoring/ping"
+  local app_path="$CCR/ccr/backend/target/backend"
+  local payara_options="--prebootcommandfile $CCR/ccr/backend/src/main/resources/pre-boot-commands.txt"
+  payara_run $app_name $http_port $debug_port "$app_path" "$payara_options" &
+}
+
 app_run() {
   local app_name=$1
   local http_port=$2
@@ -212,8 +226,8 @@ app_run() {
   local status_url=$4
   local app_path="$5"
   local payara_options="$6"
-  local checkpoint_dir="$PAYARA_VERSION_DIR/$app_name/checkpoint"
-  local payara_root="$PAYARA_VERSION_DIR/$app_name/payara-root"
+  local checkpoint_dir="$(get_checkpoint_dir $app_name)"
+  local payara_root="$(get_payara_root_dir $app_name)"
   payara_kill $http_port
   is_criu_available
   local criu_available=$?
@@ -230,6 +244,18 @@ app_run() {
       is_app_ready $status_url
     fi
   fi
+}
+
+get_checkpoint_dir() {
+  local app_name=$1
+  local checkpoint_dir="$PAYARA_VERSION_DIR/$app_name/checkpoint"
+  echo "$checkpoint_dir"
+}
+
+get_payara_root_dir() {
+  local app_name=$1
+  local payara_root="$PAYARA_VERSION_DIR/$app_name/payara-root"
+  echo "$payara_root"
 }
 
 backend_payara_clean() {
